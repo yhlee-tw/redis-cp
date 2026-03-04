@@ -38,7 +38,7 @@ class Version(object):
         return self.digits >= other.digits
 
     def __ne__(self, other):
-        return self.digits != other.digits_build
+        return self.digits != other.digits
 
 
 def redis_cp(src, keys, redis32_and_up=False, dst=None):
@@ -119,11 +119,11 @@ if __name__ == '__main__':
                      Version(dinfo.get('redis_version')) > version_320
     use_migrate = redis32_and_up and not options.nomigrate
 
-    print 'src: %s:%d/%d (%d keys)\ndst: %s:%d/%d (%d keys)\nvia: %s' % (
+    print('src: %s:%d/%d (%d keys)\ndst: %s:%d/%d (%d keys)\nvia: %s' % (
         options.src, sport, sdb, nkeys_src,
         options.dst, dport, ddb, nkeys_dst,
         'MIGRATE' if use_migrate else 'DUMP/RESTORE'
-    )
+    ))
 
     keys = []
     processed = 0
@@ -134,7 +134,7 @@ if __name__ == '__main__':
         if len(keys) >= options.batch:
             processed += len(keys)
             if options.verbose:
-                print 'migrating %d/%d keys ...' % (processed, nkeys_src)
+                print('migrating %d/%d keys ...' % (processed, nkeys_src))
             copied, skipped = redis_cp(src, keys, use_migrate, dst=dst)
             total_copied += copied
             total_skipped += skipped
@@ -145,4 +145,4 @@ if __name__ == '__main__':
         total_copied += copied
         total_skipped += skipped
 
-    print '[%s] %d keys copied, %d skipped' % ('DRYRUN' if dryrun else 'DONE', total_copied, total_skipped)
+    print('[%s] %d keys copied, %d skipped' % ('DRYRUN' if dryrun else 'DONE', total_copied, total_skipped))

@@ -27,3 +27,15 @@ redis-cp.py redis1 redis2 --sport 6379 --dport 7777
 # change batch size (default is 100, which is just a random pick)
 redis-cp.py redis1 redis2 --batch 500
 ```
+
+## Cluster Mode Support
+```
+# copy from cluster to cluster
+redis-cp.py redis-cluster1 redis-cluster2 --src-cluster --dst-cluster
+
+# copy from standalone to cluster
+redis-cp.py redis-standalone redis-cluster --dst-cluster
+
+# copy from cluster to standalone
+redis-cp.py redis-cluster redis-standalone --src-cluster
+```

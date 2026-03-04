@@ -2,6 +2,7 @@ import argparse
 import re
 
 import redis
+from redis.cluster import RedisCluster
 
 
 class Version(object):
@@ -41,41 +42,60 @@ class Version(object):
         return self.digits != other.digits
 
 
-def redis_cp(src, keys, redis32_and_up=False, dst=None):
+def redis_cp(src, keys, redis32_and_up=False, dst=None, is_cluster=False):
     """
     :param src: redis connection to src
     :param keys: keys to copied
     :param redis32_and_up: whether both connection are redis32 and up (where we can simply use the 'migrate' command)
     :param dst: redis conneciton to dst (needed if redis32_and_up==False)
+    :param is_cluster: whether we're copying to/from cluster
     :return:
     """
     copied = 0
     skipped = 0
-    if redis32_and_up:
+    if redis32_and_up and not is_cluster:
         cmd = ['MIGRATE', options.dst, dport, "", ddb, 1000, 'COPY', 'REPLACE', 'KEYS'] + keys
         # print 'cmd', cmd
         if not dryrun:
             src.execute_command(*cmd)
             copied += len(keys)
     else:
-        pipe = src.pipeline(transaction=False)
-        for key in keys:
-            pipe.pttl(key)  # restore needs msec
-            pipe.dump(key)
-        data = pipe.execute()
-        tuples = [[keys[i // 2], data[i], data[i + 1]] for i in range(0, len(data), 2)]
+        # For clusters or older Redis, use DUMP/RESTORE
+        if is_cluster:
+            # In cluster mode, we can't use pipelining across different keys/slots
+            for key in keys:
+                try:
+                    ttl = src.pttl(key)
+                    value = src.dump(key)
+                    if ttl == -2:
+                        skipped += 1
+                        continue
+                    copied += 1
+                    if not dryrun:
+                        dst.delete(key)
+                        dst.restore(key, ttl if ttl > 0 else 0, value)
+                except Exception as e:
+                    print(f'Error copying key {key}: {e}')
+                    skipped += 1
+        else:
+            pipe = src.pipeline(transaction=False)
+            for key in keys:
+                pipe.pttl(key)  # restore needs msec
+                pipe.dump(key)
+            data = pipe.execute()
+            tuples = [[keys[i // 2], data[i], data[i + 1]] for i in range(0, len(data), 2)]
 
-        dstpipe = dst.pipeline(transaction=False)
-        for tup in tuples:
-            key, ttl, value = tup
-            if ttl == -2:
-                skipped += 1
-                continue
-            copied += 1
-            if not dryrun:
-                dstpipe.delete(key)
-                dstpipe.restore(key, ttl if ttl > 0 else 0, value)
-        dstpipe.execute()
+            dstpipe = dst.pipeline(transaction=False)
+            for tup in tuples:
+                key, ttl, value = tup
+                if ttl == -2:
+                    skipped += 1
+                    continue
+                copied += 1
+                if not dryrun:
+                    dstpipe.delete(key)
+                    dstpipe.restore(key, ttl if ttl > 0 else 0, value)
+            dstpipe.execute()
     return copied, skipped
 
 
@@ -100,6 +120,10 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', dest='verbose', action='store_true', default=False)
     parser.add_argument('--pattern', dest='pattern', default='*')
     parser.add_argument('--nomigrate', dest='nomigrate', action='store_true', default=False)
+    parser.add_argument('--src-cluster', dest='src_cluster', action='store_true', default=False,
+                        help='enable cluster mode for src')
+    parser.add_argument('--dst-cluster', dest='dst_cluster', action='store_true', default=False,
+                        help='enable cluster mode for dst')
     options = parser.parse_args()
 
     dryrun = options.dryrun
@@ -107,42 +131,96 @@ if __name__ == '__main__':
     ddb = options.ddb or options.db
     sport = options.sport or options.port
     dport = options.dport or options.port
-    src = redis.StrictRedis(host=options.src, port=sport, db=sdb)
-    dst = redis.StrictRedis(host=options.dst, port=dport, db=ddb)
 
-    sinfo = src.info()
-    dinfo = dst.info()
-    nkeys_src = sinfo.get('db%d' % sdb, {}).get('keys', 0)
-    nkeys_dst = dinfo.get('db%d' % ddb, {}).get('keys', 0)
+    # Determine cluster mode
+    src_is_cluster = options.src_cluster
+    dst_is_cluster = options.dst_cluster
+    is_cluster = src_is_cluster or dst_is_cluster
+
+    # Create connections
+    if src_is_cluster:
+        src = RedisCluster(host=options.src, port=sport)
+    else:
+        src = redis.StrictRedis(host=options.src, port=sport, db=sdb)
+
+    if dst_is_cluster:
+        dst = RedisCluster(host=options.dst, port=dport)
+    else:
+        dst = redis.StrictRedis(host=options.dst, port=dport, db=ddb)
+
+    sinfo = src.info() if not src_is_cluster else src.info('server')
+    dinfo = dst.info() if not dst_is_cluster else dst.info('server')
+
+    # Get key counts
+    if src_is_cluster:
+        try:
+            nkeys_src = src.dbsize()
+        except:
+            nkeys_src = 0
+    else:
+        nkeys_src = sinfo.get('db%d' % sdb, {}).get('keys', 0)
+
+    if dst_is_cluster:
+        try:
+            nkeys_dst = dst.dbsize()
+        except:
+            nkeys_dst = 0
+    else:
+        nkeys_dst = dinfo.get('db%d' % ddb, {}).get('keys', 0)
+
     version_320 = Version('3.2.0')
-    redis32_and_up = Version(sinfo.get('redis_version')) > version_320 and \
-                     Version(dinfo.get('redis_version')) > version_320
-    use_migrate = redis32_and_up and not options.nomigrate
+    # Get version info (for cluster, get from first node)
+    if src_is_cluster:
+        first_node_info = list(sinfo.values())[0]
+        src_version = Version(first_node_info['redis_version'] if isinstance(first_node_info, dict) else '0.0.0')
+    else:
+        src_version = Version(sinfo.get('redis_version', '0.0.0'))
 
-    print('src: %s:%d/%d (%d keys)\ndst: %s:%d/%d (%d keys)\nvia: %s' % (
-        options.src, sport, sdb, nkeys_src,
-        options.dst, dport, ddb, nkeys_dst,
+    if dst_is_cluster:
+        first_node_info = list(dinfo.values())[0]
+        dst_version = Version(first_node_info['redis_version'] if isinstance(first_node_info, dict) else '0.0.0')
+    else:
+        dst_version = Version(dinfo.get('redis_version', '0.0.0'))
+
+    redis32_and_up = src_version > version_320 and dst_version > version_320
+    use_migrate = redis32_and_up and not options.nomigrate and not is_cluster
+
+    mode_desc = 'cluster' if is_cluster else 'standalone'
+    src_desc = f'{options.src}:{sport}' + ('' if src_is_cluster else f'/{sdb}')
+    dst_desc = f'{options.dst}:{dport}' + ('' if dst_is_cluster else f'/{ddb}')
+
+    pattern_desc = f" (pattern: '{options.pattern}')" if options.pattern != '*' else ''
+    print('src: %s (%d keys%s) [%s]\ndst: %s (%d keys) [%s]\nvia: %s' % (
+        src_desc, nkeys_src, pattern_desc, 'cluster' if src_is_cluster else 'standalone',
+        dst_desc, nkeys_dst, 'cluster' if dst_is_cluster else 'standalone',
         'MIGRATE' if use_migrate else 'DUMP/RESTORE'
     ))
 
     keys = []
+    keys_seen = set()
     processed = 0
     total_copied = 0
     total_skipped = 0
+    total_matched = 0
     for item in src.scan_iter(match=options.pattern, count=100):
+        # Deduplicate in cluster mode
+        if is_cluster and item in keys_seen:
+            continue
+        keys_seen.add(item)
         keys.append(item)
+        total_matched += 1
         if len(keys) >= options.batch:
             processed += len(keys)
             if options.verbose:
-                print('migrating %d/%d keys ...' % (processed, nkeys_src))
-            copied, skipped = redis_cp(src, keys, use_migrate, dst=dst)
+                print('migrating %d keys ...' % len(keys))
+            copied, skipped = redis_cp(src, keys, use_migrate, dst=dst, is_cluster=is_cluster)
             total_copied += copied
             total_skipped += skipped
             keys = []
     if keys:
         processed += len(keys)
-        copied, skipped = redis_cp(src, keys, use_migrate, dst=dst)
+        copied, skipped = redis_cp(src, keys, use_migrate, dst=dst, is_cluster=is_cluster)
         total_copied += copied
         total_skipped += skipped
 
-    print('[%s] %d keys copied, %d skipped' % ('DRYRUN' if dryrun else 'DONE', total_copied, total_skipped))
+    print('[%s] %d keys copied, %d skipped (matched %d keys with pattern)' % ('DRYRUN' if dryrun else 'DONE', total_copied, total_skipped, total_matched))

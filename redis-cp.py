@@ -66,14 +66,17 @@ def redis_cp(src, keys, redis32_and_up=False, dst=None, is_cluster=False):
             for key in keys:
                 try:
                     ttl = src.pttl(key)
-                    value = src.dump(key)
                     if ttl == -2:
+                        skipped += 1
+                        continue
+                    value = src.dump(key)
+                    if value is None:
                         skipped += 1
                         continue
                     copied += 1
                     if not dryrun:
-                        dst.delete(key)
-                        dst.restore(key, ttl if ttl > 0 else 0, value)
+                        # dst.delete(key)
+                        dst.restore(key, ttl if ttl > 0 else 0, value, replace=True)
                 except Exception as e:
                     print(f'Error copying key {key}: {e}')
                     skipped += 1
@@ -88,14 +91,14 @@ def redis_cp(src, keys, redis32_and_up=False, dst=None, is_cluster=False):
             dstpipe = dst.pipeline(transaction=False)
             for tup in tuples:
                 key, ttl, value = tup
-                if ttl == -2:
+                if ttl == -2 or value is None:
                     skipped += 1
                     continue
                 copied += 1
                 if not dryrun:
-                    dstpipe.delete(key)
-                    dstpipe.restore(key, ttl if ttl > 0 else 0, value)
-            dstpipe.execute()
+                    dstpipe.restore(key, ttl if ttl > 0 else 0, value, replace=True)
+            if not dryrun:
+                dstpipe.execute()
     return copied, skipped
 
 
